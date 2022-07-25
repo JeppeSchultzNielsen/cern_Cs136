@@ -1,2 +1,5 @@
 # Project exclude paths
 /cmake-build-debug/
+/data/Run103.root
+/sorted.root
+/data/Run118.root
