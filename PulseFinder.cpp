@@ -70,8 +70,8 @@ public:
     }
 
     void loadHistogram(){
-        //TFile *myFile = TFile::Open("pulseHistogram.root");
-        unique_ptr<TFile> myFile(TFile::Open("pulseHistogram.root"));
+        TFile *myFile = TFile::Open("pulseHistogram.root");
+        //unique_ptr<TFile> myFile(TFile::Open("pulseHistogram.root"));
         histogram = (TH1F *) myFile->Get("pulsefinding");
     }
 
@@ -125,6 +125,11 @@ public:
     }
 };
 
+
+
+
+
+
 class SortedPulseFileCreator{
 public:
     string filename;
@@ -156,7 +161,10 @@ public:
         TTree *sorted = new TTree("Sorted", "Sorted");
         sorted->Branch("energy", &energySorted);
         sorted->Branch("time", &timestampSorted);
+        sorted->Branch("oldtime", &timestamp);
         sorted->Branch("beta", &energyBetaSorted);
+
+        int pulseNoCheck = 11;
 
         int currentTimeStampIndex = 0;
         for(int i = 0; i < entries; i++){
@@ -166,25 +174,39 @@ public:
             energyBetaSorted = {};
             //dont want to start in middle of collection: start at first pulse
             if(timestamp < timeStamps[0]) continue;
+            if(timestamp < timeStamps[pulseNoCheck - 1]) continue;
+            if(timestamp > timeStamps[pulseNoCheck]) continue;
+            //dont want to count ending, where it might be cut
+            if(timestamp > timeStamps[timeStamps.size()-1]) continue;
             if(timestamp > timeStamps[currentTimeStampIndex+1]){currentTimeStampIndex++;}
+            bool filled = false;
             for(int j = 0; j < 16; j++){
                 if(Clov_En[j] > 0.1){
                     energySorted.push_back(Clov_En[j]);
+                    filled = true;
                 }
             }
             for(int j = 0; j < 4; j++){
                 if(energyBeta[j] > 0.1){
                     energyBetaSorted.push_back(energyBeta[j]);
+                    filled = true;
                 }
             }
-            timestampSorted = timestamp - timeStamps[currentTimeStampIndex];
-            sorted->Fill();
+            if(filled){
+                timestampSorted = timestamp - timeStamps[currentTimeStampIndex];
+                sorted->Fill();
+            }
         }
         sorted -> Write();
         myFile -> Close();
         file -> Close();
     }
 };
+
+
+
+
+
 
 class DelayedHistogramCreator{
 public:
@@ -195,8 +217,15 @@ public:
     DelayedHistogramCreator(int t1, int t2, int dt) : t_1(t1), t_2(t2), dt(dt) {
     }
 
-    static double gauss2nd(double *x, double *par){
-        return par[0] + par[1]*x[0] + par[2]*x[0]*x[0] + par[3]*TMath::Gaus(x[0],par[4],par[5], true);
+    static double crystalball_function(double x, double alpha, double n, double sigma, double mean) {
+        auto absa = abs(alpha);
+        double A = pow(n/absa,n)* exp(-(x-mean)*(x-mean)/(2*sigma*sigma));
+        double B = n/absa - absa;
+
+    }
+
+    static double gaussLin(double *x, double *par){
+        return par[0] + par[1]*x[0] + par[2]*TMath::Gaus(x[0],par[3],par[4], true);
     }
 
     static vector<double> findGuesses(double centroidGuess, double fittingWidth, TH1F *histogram){
@@ -205,14 +234,34 @@ public:
         auto upperBin = histogram -> FindBin(centroidGuess + fittingWidth);
         double ymax = 0;
         double xmax = 0;
+
+        int sum = 0;
+        int iter = 0;
+
         for(int k = lowerBin; k < upperBin; k++){
             double y = histogram->GetBinContent(k);
             if(y > ymax){
                 ymax = y;
                 xmax = histogram->GetBinCenter(k);
             }
+            sum += y;
+            iter++;
         }
-        return {ymax-histogram->GetBinContent(lowerBin), xmax};
+
+        double avgpoint;
+        bool unbroken = true;
+
+        for(int k = histogram->GetXaxis()->FindBin(xmax); unbroken; k++) {
+            if (histogram->GetBinContent(k) < sum / iter) {
+                avgpoint = (histogram->GetBinCenter(k) - xmax);
+                unbroken = false;
+            }
+            if (k > histogram->GetXaxis()->FindBin(xmax) + 800) {
+                avgpoint = fittingWidth;
+                unbroken = false;
+            }
+        }
+        return {ymax-histogram->GetBinContent(lowerBin), xmax, histogram->GetBinContent(lowerBin), avgpoint};
     }
 
     void generateHistograms(string filename, bool betaGate,double fittingWidth){
@@ -258,24 +307,50 @@ public:
         ofstream mytxt (saveto);
 
         vector<double> expectedPeaks = {105,340,518,818,1048,1235};
+        vector<double> lowerBounds = {103.5,339,514,814,1044,1230};
+        vector<double> upperBounds = {106,342,524,825,1052,1245};
         //histograms are now created, can fit the peaks in each of them.
         for(int i = 0; i < expectedPeaks.size(); i++){
             //first fit on the early histogram
             auto max = findGuesses(expectedPeaks[i],fittingWidth,earlyHist);
             //fit Gauss with 2nd degree background
-            TF1 *func = new TF1("fit", gauss2nd,expectedPeaks[i]-fittingWidth,expectedPeaks[i]+fittingWidth,6);
-            func ->SetParameters(0,0,0,max[0],max[1],1);
-            TFitResultPtr fp = earlyHist->Fit("fit","+ && Q && S","",expectedPeaks[i]-fittingWidth,expectedPeaks[i]+fittingWidth);
-            auto counts1 = fp -> Parameter(3);
+            auto noOuts = 7;
+
+            TF1 *func = new TF1("fit", gaussLin,expectedPeaks[i]-noOuts*max[3],expectedPeaks[i]+noOuts*max[3],5);
+            func ->SetParameters(0,0,3*max[0],max[1],0.5);
+            TFitResultPtr fp = earlyHist->Fit("fit","+ && Q && S && L","",expectedPeaks[i]-noOuts*max[3],expectedPeaks[i]+noOuts*max[3]);
+            auto counts1 = fp -> Parameter(2);
+            auto aEarly = fp ->Parameter(1);
+            auto bEarly = fp ->Parameter(0);
 
             //fit also the the laterhist
             max = findGuesses(expectedPeaks[i],fittingWidth,laterHist);
-            func = new TF1("fit", gauss2nd,expectedPeaks[i]-fittingWidth,expectedPeaks[i]+fittingWidth,6);
-            func ->SetParameters(0,0,0,max[0],max[1],1);
-            fp = laterHist->Fit("fit","+ && Q && S","",expectedPeaks[i]-fittingWidth,expectedPeaks[i]+fittingWidth);
+            func = new TF1("fit", gaussLin,expectedPeaks[i]-noOuts*max[3],expectedPeaks[i]+noOuts*max[3],5);
+            func ->SetParameters(0,0,3*max[0],max[1],0.5);
+            fp = laterHist->Fit("fit","+ && Q && S && L","",expectedPeaks[i]-noOuts*max[3],expectedPeaks[i]+noOuts*max[3]);
+            auto aLate = fp ->Parameter(1);
+            auto bLate = fp ->Parameter(0);
 
+            double_t earlySum = 0;
+            double_t lateSum = 0;
+
+            //also count directly the counts w/o fitting and subtract the linear background.
+            for(int j = 0; j < earlyHist -> GetNbinsX(); j++){
+                if(earlyHist ->GetBinCenter(j) >= lowerBounds[i] and earlyHist ->GetBinCenter(j) <= upperBounds[i]){
+                    earlySum += earlyHist ->GetBinContent(j);
+                }
+
+                if(laterHist ->GetBinCenter(j) >= lowerBounds[i] and laterHist ->GetBinCenter(j) <= upperBounds[i]){
+                    lateSum += laterHist ->GetBinContent(j);
+                }
+            }
+
+            auto earlyBackground = 1./2*aEarly*(pow(upperBounds[i],2)-pow(lowerBounds[i],2)) + bEarly*(upperBounds[i]-lowerBounds[i]);
+            auto lateBackground = 1./2*aLate*(pow(upperBounds[i],2)-pow(lowerBounds[i],2)) + bLate*(upperBounds[i]-lowerBounds[i]);
             //save results to txt
-            mytxt << expectedPeaks[i] << "\t" << counts1 << "\t" << fp -> Parameter(3) << "\n";
+
+            mytxt << expectedPeaks[i] << "\t" << counts1 << "\t" << fp -> Parameter(2) << "\t" << earlySum <<
+            "\t" << earlyBackground << "\t" << lateSum << "\t" << lateBackground << "\n";
         }
 
         mytxt.close();
@@ -289,18 +364,112 @@ public:
     }
 
 
+
+
+
+
+
+};
+
+class SortedDecay{
+public:
+    SortedDecay(){};
+
+    void decay(string filename, int dt, int t1, int lowerBound, int upperBound){
+        unique_ptr<TFile> myFile(TFile::Open(filename.c_str()));
+        TTree *t = (TTree *) myFile->Get("Sorted");
+
+        auto entries = t -> GetEntries();
+        vector<double_t> *energy = 0;
+        vector<double_t> *beta = 0;
+        ULong64_t timestamp = 0;
+
+        t->SetBranchAddress("energy", &energy);
+        t->SetBranchAddress("beta", &beta);
+        t->SetBranchAddress("time", &timestamp);
+        ULong64_t t0 = timestamp;
+        ULong64_t currentTime = timestamp;
+
+        vector<int> times = {};
+        times.push_back(0);
+
+        for(int i = 0; i < int((39900-(t1))/dt); i++){
+            times.push_back(t1+dt*i);
+        }
+
+        long sums[times.size()];
+
+        for(int i = 0; i < times.size(); i++){
+            sums[i] = 0;
+        }
+
+        string saveto = "decay/dt:"+ to_string(dt)+"lower"+ to_string(lowerBound)+"upper"+ to_string(upperBound)+".txt";
+        ofstream mytxt (saveto);
+
+        int sum = 0;
+        int factor = 1;
+        string histname = "hist";
+        TH1F *hist = new TH1F(histname.c_str(),histname.c_str(),12000,0,3000);
+
+        for(int i = 1; i < entries; i++){
+            t->GetEntry(i);
+            if(i%1000000 == 0){cout << 1.*i/entries << endl;}
+
+            for(int j = 0; j < energy -> size(); j++){
+                hist -> Fill(energy -> at(j));
+                if(energy -> at(j) > lowerBound){
+                    if(energy -> at(j) < upperBound){
+                        auto mybool = true;
+                        for(int k = 0; mybool;k++){
+                            if(timestamp < 3000){ mybool = false;}
+                            if(timestamp > times[times.size()-1]+dt){ mybool = false;}
+                            else{
+                                if(timestamp < times[k]){
+                                    sums[k-1]++;
+                                    mybool = false;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for(int i = 0; i < times.size();i++){
+            mytxt << times[i] << "\t" << sums[i] << endl;
+        }
+
+        string histfilename = "decay/histogram.root";
+        TFile *histFile = TFile::Open(histfilename.c_str(), "RECREATE");
+        hist -> Write();
+        histFile -> Close();
+
+        mytxt.close();
+    }
 };
 
 int main() {
-    /*auto puls = new PulseFinder();
+    auto puls = new PulseFinder();
+    //puls ->createHistogram("data/Run102.root",518,4);
     puls -> loadHistogram();
-    puls -> findPulses();
-    auto sortedCreator = new SortedPulseFileCreator("data/Run103.root");
-    sortedCreator ->createSortedPulseFile("sorted.root");*/
-
-    auto histCreator = new DelayedHistogramCreator(3000,19000,15000);
-    histCreator ->generateHistograms("sorted.root",false,10);
-    histCreator = new DelayedHistogramCreator(3000,34000,5000);
-    histCreator ->generateHistograms("sorted.root",false,10);
-    return 0;
+    auto pulses = puls -> findPulses();
+    for(int i = 0; i < pulses.size(); i++){
+        cout << pulses[i]-555.691503e6-42000*i << endl;
+    }
+    auto sortedCreator = new SortedPulseFileCreator("data/Run102.root");
+    sortedCreator ->createSortedPulseFile("sorted102.root");
+    auto d = new SortedDecay();
+    d ->decay("sorted102.root",100,3000,513,522);
+    /*auto sortedCreator = new SortedPulseFileCreator("data/Run102.root");
+    sortedCreator ->createSortedPulseFile("sorted102.root");*/
+    //auto sortedCreator = new SortedPulseFileCreator("data/Run102.root");
+    //sortedCreator ->createSortedPulseFile("sorted102.root");
+    /*int dt = 100;
+    for(int i = 1; i < 125; i++){
+        auto histCreator = new DelayedHistogramCreator(3000,39500-i*dt,i*dt);
+        histCreator ->generateHistograms("sorted102.root",false,4);
+    }*/
+    /*auto d = new SortedDecay();
+    d ->decay("sorted102.root",100,3000,513,522);
+    return 0;*/
 }
